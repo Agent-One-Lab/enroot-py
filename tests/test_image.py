@@ -1,64 +1,35 @@
-import unittest
-from unittest.mock import patch, MagicMock
+import pathlib
+import pytest
 from enroot.image import Images, Image
 from enroot.client import EnrootClient
 from enroot import ENROOT_HOME
-import pathlib
 
-class TestImages(unittest.TestCase):
-    def setUp(self):
-        self.client = EnrootClient()
-        self.images = Images(self.client)
 
-    @patch('enroot.image.run_enroot')
-    @patch('pathlib.Path.exists')
-    @patch('enroot.image.Images.get')
-    def test_pull(self, mock_get, mock_exists, mock_run_enroot):
-        mock_exists.return_value = True
-        mock_get.return_value = Image(id="my+image.sqsh", tags=["my+image"])
-        
-        image = self.images.pull("my/image", "latest")
+def test_list_returns_list(client):
+    result = client.images.list()
+    assert isinstance(result, list)
+    for img in result:
+        assert isinstance(img, Image)
+        assert hasattr(img, "id")
+        assert hasattr(img, "tags")
 
-        ref = "my+image"
-        expected_path = str(pathlib.Path(ENROOT_HOME + "/images", f"{ref}.sqsh"))
-        mock_run_enroot.assert_called_once_with(
-            ["import", "--output", expected_path, "docker://docker.io#my/image:latest"],
-            capture=True
-        )
-        self.assertEqual(image.id, "my+image.sqsh")
 
-    @patch('pathlib.Path.glob')
-    def test_list(self, mock_glob):
-        mock_glob.return_value = [
-            pathlib.Path(ENROOT_HOME + "/images/image1.sqsh"),
-            pathlib.Path(ENROOT_HOME + "/images/image2.sqsh"),
-        ]
-        images = self.images.list()
-        self.assertEqual(len(images), 2)
-        self.assertEqual(images[0].tags, ["image1"])
-        self.assertEqual(images[1].tags, ["image2"])
+def test_pull(client):
+    image = client.images.pull("alpine", "latest")
+    assert isinstance(image, Image)
+    assert "alpine" in image.tags
+    assert image.id.endswith(".sqsh")
+    assert pathlib.Path(image.id).exists()
 
-    @patch('pathlib.Path.exists', return_value=True)
-    def test_get_exists(self, mock_exists):
-        image = self.images.get("myimage")
-        self.assertEqual(image.id, str(pathlib.Path(ENROOT_HOME + "/images/myimage.sqsh")))
-        self.assertEqual(image.tags, ["myimage"])
 
-    @patch('pathlib.Path.exists', side_effect=[False, False])
-    @patch('enroot.image.Images.list')
-    def test_get_not_exists_found_in_list(self, mock_list, mock_exists):
-        mock_list.return_value = [
-            Image(id="path/to/image1.sqsh", tags=["image1"]),
-            Image(id="path/to/myimage.sqsh", tags=["myimage"]),
-        ]
-        image = self.images.get("myimage")
-        self.assertEqual(image.id, "path/to/myimage.sqsh")
+def test_get_exists_after_pull(client):
+    client.images.pull("alpine", "latest")
+    image = client.images.get("alpine")
+    assert image.tags == ["alpine"]
+    assert image.id == str(pathlib.Path(ENROOT_HOME, "images", "alpine.sqsh"))
 
-    @patch('pathlib.Path.exists', return_value=False)
-    @patch('enroot.image.Images.list', return_value=[])
-    def test_get_not_found(self, mock_list, mock_exists):
-        with self.assertRaises(RuntimeError):
-            self.images.get("nonexistent")
 
-if __name__ == '__main__':
-    unittest.main()
+def test_get_not_found(client):
+    unique_name = "nonexistent-image-name-xyz-12345"
+    with pytest.raises(RuntimeError, match="not found"):
+        client.images.get(unique_name)

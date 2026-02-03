@@ -16,3 +16,6 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
+

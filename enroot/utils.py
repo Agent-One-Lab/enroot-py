@@ -94,28 +94,27 @@ def parse_list(text: str) -> Dict[str, Dict[str, Any]]:
 
 def run_enroot(args: List[str],
                 capture: bool = True,
-                check: bool = False,
+                check: bool = True,
                 text: bool = True) -> str:
-    # """
-    # If called from sync code → run normally (blocking).
-    # If called while an event-loop is running → delegate to a_run_enroot().
-    # """
-    # try:
-    #     loop = asyncio.get_running_loop()
-    # except RuntimeError:
-    #     loop = None
-
-    # if loop and loop.is_running():
-    #     return loop.run_until_complete(a_run_enroot(args, capture, check, text))
-    # else:
+    """Run enroot command. Raises RuntimeError with stderr on non-zero exit when check=True."""
+    cmd = ["enroot", *map(str, args)]
     proc = subprocess.run(
-            ["enroot", *map(str, args)],
-            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-            stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
-        )
-    if check and proc.returncode:
-        raise RuntimeError(f"$ {' '.join(args)}\n{proc.stderr}")
-    return proc.stdout.decode().strip() if capture else ""
+        cmd,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,  # always capture stderr for error messages
+        text=text,
+    )
+    if proc.returncode != 0:
+        err_msg = proc.stderr.strip() if proc.stderr else "(no stderr)"
+        out_msg = proc.stdout.strip() if (capture and proc.stdout) else ""
+        details = [f"exit code: {proc.returncode}", f"stderr: {err_msg}"]
+        if out_msg:
+            details.append(f"stdout: {out_msg}")
+        if check:
+            raise RuntimeError(
+                f"enroot failed: {' '.join(args)}\n" + "\n".join(details)
+            )
+    return (proc.stdout.strip() if capture and proc.stdout else "")
 
 def clear_enroot_containers() -> None:
     run_enroot(["remove", "--force", "$(enroot list)"], capture=False)

@@ -17,11 +17,24 @@ class Images:
     def __init__(self, cli: "EnrootClient"):
         self._cli = cli
 
-    def pull(self, repository: str, tag: str | None = None, registry_host: str = "docker.io") -> Image:
+    def pull(self, repository: str, tag: str | None = None, registry_host: str = "") -> Image:
+
+        if registry_host == "":
+            repository_full = f"docker://{repository}"
+        else:
+            repository_full = f"docker://{registry_host}#{repository}"
+        
+        if tag is not None:
+            repository_full += f":{tag}"
+        
         if tag is None:
             tag = "latest"
         ref = repository.replace("/", "+")
-        run_enroot(["import", "--output", os.path.join(ENROOT_HOME, "images", f"{ref}.sqsh"), f"docker://{registry_host}#{repository}:{tag}"], capture=True)
+
+        destination = os.path.join(ENROOT_HOME, "images", f"{ref}.sqsh")
+        
+        if not os.path.exists(destination):
+            run_enroot(["import", "--output", destination, repository_full], capture=True)
         return self.get(ref)
 
     def list(self, **_) -> List[Image]:

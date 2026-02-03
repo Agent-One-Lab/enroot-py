@@ -2,6 +2,7 @@ from typing import List, Dict, Any, TYPE_CHECKING
 from .utils import run_enroot, parse_list, systemd_prefix, random_name, allocate_free_port
 if TYPE_CHECKING:
     from .client import EnrootClient
+import os
 import shlex
 import subprocess
 import time
@@ -49,6 +50,15 @@ class Container:
     def kill(self, **_):
         run_enroot(["remove", "--force", self.name], capture=False)
         self._status = "exited"
+        # Reap the "enroot start" process so it doesn't linger and affect the terminal
+        if self._process is not None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                self._process = None
 
     def remove(self, force: bool = False, **_):
         run_enroot(["remove", "--force" if force else "", self.name],
@@ -94,7 +104,7 @@ class Containers:
     def __init__(self, cli: "EnrootClient"):
         self._cli = cli
 
-    def run(self, image, command=None, name=None, *, detach=False,
+    def run(self, image, command=None, name=None, timeout=30, detach=False,
             remove=False, ports=None, environment=None,
             cpu_count: float | None = None, mem_limit: str | int | None = None,
             cpus: float | None = None,  # docker-py synonym
@@ -151,20 +161,39 @@ class Containers:
         if command:
             start_cmd += shlex.split(command) if isinstance(command, str) \
                          else list(command)
-        print(start_cmd)
         process = subprocess.Popen(start_cmd,
+                         stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL if not ENROOT_DEBUG else None,
                          stderr=subprocess.DEVNULL if not ENROOT_DEBUG else None,
-                         start_new_session=True)
+                         start_new_session=True,
+                         text=True)
+        # Note: by using a pipe for stdin, we prevent enroot from holding onto
+        # the terminal's stdin, which caused issues on exit. The pipe will
+        # be closed automatically when this process exits.
 
-        deadline = time.time() + 15
+
+
+        deadline = time.time() + timeout
         while time.time() < deadline:
+            # If start process already exited with error, fail fast
+            if process.poll() is not None and process.returncode != 0:
+                raise RuntimeError(
+                    f"Container '{name}' failed to start (exit {process.returncode})."
+                )
             container_info = parse_list(run_enroot(["list", "--fancy"])).get(name, {})
             if container_info.get("pids"):
-                break
+                return Container(self._cli, name, port_map, process=process)
             time.sleep(0.1)
 
-        return Container(self._cli, name, port_map, process=process)
+        # Container did not appear within deadline
+        if process.poll() is not None and process.returncode != 0:
+            raise RuntimeError(
+                f"Container '{name}' failed to start (exit {process.returncode})."
+            )
+        raise RuntimeError(
+            f"Container '{name}' did not appear in 'enroot list' within {timeout}s. "
+            "Check 'enroot start' or 'enroot list --fancy' output."
+        )
 
     def list(self, **_) -> List[Container]:
         names = parse_list(run_enroot(["list"])).keys()
