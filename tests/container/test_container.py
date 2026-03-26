@@ -1,4 +1,5 @@
 import pytest
+import enroot
 from enroot.container import Containers, Container
 
 
@@ -20,7 +21,7 @@ def test_get_found(running_container):
 
 def test_get_not_found(client):
     unique_name = "nonexistent-container-xyz-12345"
-    with pytest.raises(RuntimeError, match="not found"):
+    with pytest.raises(enroot.errors.NotFound, match="not found"):
         client.containers.get(unique_name)
 
 
@@ -54,7 +55,7 @@ def test_remove_force(client):
 def test_exec_run(running_container):
     result = running_container.exec_run("echo hello")
     assert result.exit_code == 0
-    assert "hello" in result.output
+    assert "hello" in result.output.decode()
 
 
 def test_reload_running(running_container):

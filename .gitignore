@@ -9,4 +9,8 @@
 *.pyzw
 *.pyzwz
 *.pyzwzw
-*.pyzwzwz
+*.ipynb
+*.ipynb_checkpoints
+
+# data
+data/

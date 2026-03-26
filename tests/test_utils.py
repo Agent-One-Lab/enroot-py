@@ -1,6 +1,6 @@
 import shutil
 import pytest
-from enroot.utils import random_name, parse_list, systemd_prefix
+from enroot.utils import random_name, parse_list, systemd_prefix, mem_limit_to_bytes
 
 
 def test_random_name():
@@ -31,6 +31,15 @@ my-cont   12345     running   2 hours ago  0.01s     402653     402653    /bin/b
     assert "my-cont" in parsed
     assert parsed["my-cont"]["pids"] == [12345]
     assert parsed["my-cont"]["state"] == "running"
+
+
+def test_mem_limit_to_bytes():
+    assert mem_limit_to_bytes(1024) == 1024
+    assert mem_limit_to_bytes("1024") == 1024
+    assert mem_limit_to_bytes("512k") == 512 * 1024
+    assert mem_limit_to_bytes("2m") == 2 * 1024**2
+    assert mem_limit_to_bytes("1G") == 1024**3
+    assert mem_limit_to_bytes("0") == 0
 
 
 def test_systemd_prefix_no_limits():
