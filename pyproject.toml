@@ -17,7 +17,11 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0.0"]
+dev = [
+    "pytest>=7.0.0",
+    "mkdocs<2.0",
+    "mkdocs-material",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

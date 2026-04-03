@@ -3,6 +3,7 @@ from .config import (
     ENROOT_HOME,
     ENROOT_DEBUG,
     ENROOT_ASYNC,
+    configure_logging,
 )
 from .client import EnrootClient, from_env
 from .container import Container, Containers, ExecResult
@@ -33,6 +34,7 @@ __all__ = [
     "ENROOT_HOME",
     "ENROOT_DEBUG",
     "ENROOT_ASYNC",
+    "configure_logging",
     "run_enroot",
     "run_enroot_async",
     "parse_list",

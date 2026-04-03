@@ -48,6 +48,12 @@ class ExecResult:
         return 2
 
 class Container:
+    """Represents a single Enroot container.
+
+    This wrapper provides a docker-py–style API (for example, :meth:`start`,
+    :meth:`exec_run`, :meth:`reload`) on top of the ``enroot`` CLI. A container
+    is identified by its name, which Enroot also uses as the container ID.
+    """
     # Class-wide cache to reduce repeated `enroot list` pressure.
     # Keyed by container name (enroot uses name as container id).
     _PID_CACHE: Dict[str, List[int]] = {}
@@ -119,7 +125,16 @@ class Container:
         return self._cli
 
     def stop(self, timeout: int = 10, **_):
-        """Stop the container (Docker-compat). Sends SIGTERM to the start process, waits, then kill + remove."""
+        """Stop the container.
+
+        Sends SIGTERM to the tracked start process (if any), waits up to ``timeout``
+        seconds, then forcefully kills and removes the container if it is still
+        running. Mirrors docker-py ``Container.stop`` semantics as closely as
+        possible.
+
+        Args:
+            timeout: Maximum number of seconds to wait for a graceful stop.
+        """
         if self._process is None:
             if not self.pids:
                 self.reload()
@@ -143,6 +158,11 @@ class Container:
         self._status = "exited"
 
     def reload(self):
+        """Refresh this container's state from ``enroot list``.
+
+        This updates cached PIDs, status, and docker-py–like metadata such as
+        ``attrs["State"]`` and ``attrs["NetworkSettings"]``.
+        """
         meta = self._meta()
         self.pids = meta.get("pids", [])
         if self.pids:
@@ -168,12 +188,19 @@ class Container:
         self._attrs["State"]["Running"] = running
 
     def put_archive(self, path: str, data: Union[bytes, BinaryIO]) -> bool:
-        """
-        Insert a file or folder in this container using a tar archive as source.
-        Aligned with docker-py Container.put_archive(path, data).
-        path: path inside the container where the archive will be extracted (must exist).
-        data: tar archive as bytes or a file-like object.
-        Returns True if the call succeeds.
+        """Insert a file or directory into the container from a tar archive.
+
+        Args:
+            path: Path inside the container where the archive will be extracted
+                (must already exist).
+            data: Tar archive as bytes or a file-like object.
+
+        Returns:
+            True if the operation succeeds.
+
+        Raises:
+            errors.APIError: If the container is not running, the operation times
+                out, or ``tar`` exits with a non-zero status.
         """
         if not self.pids:
             self.reload()
@@ -201,10 +228,13 @@ class Container:
         return True
 
     def copy_to(self, local_path: str, container_path: str):
-        """
-        Copies a local file or directory into the running container.
-        Uses a tar pipe to avoid permission and path issues.
-        Convenience wrapper: builds tar from local_path and calls put_archive.
+        """Copy a local file or directory into the running container.
+
+        Builds a tar archive on the host and forwards it to :meth:`put_archive`.
+
+        Args:
+            local_path: Path to the local file or directory.
+            container_path: Destination path inside the container.
         """
         local_path = os.path.abspath(local_path)
         if os.path.isdir(local_path):
@@ -216,6 +246,12 @@ class Container:
 
 
     def kill(self, **_):
+        """Forcefully stop and remove this container.
+
+        This is intended to mirror docker-py ``Container.kill`` semantics:
+        terminate the local start process (if tracked) and then remove the
+        container via ``enroot remove --force``.
+        """
         # Stop the "enroot start" process first so remove can succeed.
         if self._process is not None:
             try:
@@ -230,6 +266,11 @@ class Container:
         self._status = "exited"
 
     def remove(self, force: bool = False, **_):
+        """Remove this container via ``enroot remove``.
+
+        Args:
+            force: If True, passes ``--force`` to ``enroot remove``.
+        """
         cmd = ["remove", self.name]
         if force:
             cmd.insert(1, "--force")
@@ -244,10 +285,25 @@ class Container:
               cpus: float | None = None,
               timeout: int = 30,
               **_):
-        """Start this container. Similar to docker start. Use after create().
+        """Start this container.
 
-        If neither ``command`` nor the stored create-time command is set, ``enroot start``
-        uses the image default (same idea as Docker CMD/ENTRYPOINT).
+        This is similar to ``docker start`` and should be used after
+        :meth:`Containers.create`.
+
+        Args:
+            command: Optional override command to run instead of the image default.
+            environment: Optional mapping of environment variables to inject.
+            mount: Optional mapping of host paths to mount options.
+            cpu_count: Optional CPU limit used when constructing the systemd unit.
+            mem_limit: Optional memory limit (bytes or human-readable string).
+            cpus: Docker-py style synonym for ``cpu_count``.
+            timeout: Maximum number of seconds to wait for the container to appear
+                in ``enroot list``.
+
+        Raises:
+            errors.APIError: If ``enroot start`` exits with a non-zero status.
+            errors.TimeoutError: If the container does not appear in
+                ``enroot list`` before ``timeout`` expires.
         """
         command = command if command is not None else getattr(self, "_start_command", None)
         env_options = []
@@ -429,14 +485,15 @@ class Container:
         self._attrs["State"]["Running"] = running
 
     async def kill_async(self, timeout: int = 10, **_):
-        """
-        Async version of :meth:`kill`.
+        """Asynchronously forcefully stop and remove this container.
 
-        Best-effort async cleanup.
+        Best-effort async cleanup. The container may have been started via either
+        sync :meth:`start` (``subprocess.Popen``) or async :meth:`start_async`
+        (``asyncio.subprocess.Process``).
 
-        In practice, the container may have been started via either sync ``start()``
-        (so :attr:`_process` is a ``subprocess.Popen``) or async ``start_async()``
-        (so :attr:`_process` is an ``asyncio.subprocess.Process``).
+        Args:
+            timeout: Maximum number of seconds to wait for the tracked process to
+                exit before sending a kill signal.
         """
         if self._process is not None:
             proc = self._process
@@ -490,7 +547,25 @@ class Container:
         timeout: int = 30,
         **_,
     ):
-        """Async version of :meth:`start` (non-blocking polling, same semantics)."""
+        """Asynchronously start this container.
+
+        Non-blocking polling variant of :meth:`start` with equivalent semantics.
+
+        Args:
+            command: Optional override command to run instead of the image default.
+            environment: Optional mapping of environment variables to inject.
+            mount: Optional mapping of host paths to mount options.
+            cpu_count: Optional CPU limit used when constructing the systemd unit.
+            mem_limit: Optional memory limit (bytes or human-readable string).
+            cpus: Docker-py style synonym for ``cpu_count``.
+            timeout: Maximum number of seconds to wait for the container to appear
+                in ``enroot list``.
+
+        Raises:
+            errors.APIError: If ``enroot start`` exits with a non-zero status.
+            errors.TimeoutError: If the container does not appear in
+                ``enroot list`` before ``timeout`` expires.
+        """
         command = command if command is not None else getattr(self, "_start_command", None)
         env_options = []
         environment = environment or {}
@@ -659,6 +734,7 @@ class Container:
         return ExecResult(exit_code=rc, output=output)
 
     def logs(self, **_) -> bytes:
+        """Return container logs (not implemented; returns ``b''``)."""
         return b""
 
     @property
@@ -675,7 +751,13 @@ class Container:
 
 
 class Containers:
+    """Container collection helper exposed as ``client.containers``."""
+
     def __init__(self, cli: "EnrootClient"):
+        """Collection helper exposed as ``client.containers``.
+
+        This is the main entry point for creating, listing and looking up containers.
+        """
         self._cli = cli
 
     def run(self, image, command=None, name=None, timeout=120, detach=False,
@@ -683,6 +765,35 @@ class Containers:
             cpu_count: float | None = None, mem_limit: str | int | None = None,
             cpus: float | None = None,  # docker-py synonym
             **_):
+        """Create and start a container in detach mode.
+
+        This is a convenience wrapper for creating an Enroot container, launching
+        it, and returning a :class:`Container` object.
+
+        Args:
+            image: Image reference (string or :class:`Image`).
+            command: Optional command to run inside the container.
+            name: Optional explicit container name; otherwise a random name is used.
+            timeout: Maximum number of seconds to wait for the container to appear
+                in ``enroot list``.
+            detach: Must be ``True``; non-detach mode is not implemented.
+            remove: Currently ignored; present for docker-py compatibility.
+            ports: Optional port mappings in docker-py style (for example, ``{"8080/tcp": 8080}``).
+            mount: Optional mount specification mapping host paths to options.
+            environment: Optional dict of environment variables.
+            cpu_count: Optional CPU limit for the systemd unit.
+            mem_limit: Optional memory limit for the systemd unit.
+            cpus: Docker-py style synonym for ``cpu_count``.
+
+        Returns:
+            A :class:`Container` representing the started container.
+
+        Raises:
+            NotImplementedError: If ``detach`` is False.
+            errors.APIError: If the container fails to start.
+            errors.TimeoutError: If the container does not appear in
+                ``enroot list`` before ``timeout`` expires.
+        """
         if not detach:
             raise NotImplementedError("detach=False not supported")
 
@@ -699,7 +810,7 @@ class Containers:
             raise
         except Exception as e:
             raise errors.APIError(str(e)) from e
-        print(f"[Enroot] create {['create', '--name', name, img.id]}.")
+        logger.debug("create %s", ["create", "--name", name, img.id])
         try:
             run_enroot(["create", "--name", name, img.id], check=True)
         except RuntimeError as e:
@@ -728,23 +839,12 @@ class Containers:
         # launch
         prefix = systemd_prefix(cpu_limit, mem_limit)
 
-        # Test Echo
-        # echo_cmd = "echo $(pwd)"
-        # echo_process = subprocess.Popen(echo_cmd,
-        #                  stdout=subprocess.PIPE,
-        #                  stderr=subprocess.PIPE,
-        #                  text=True,
-        #                  shell=True)
-        # echo_stdout, echo_stderr = echo_process.communicate()
-        # print(f"echo stdout: {echo_stdout}")
-        # print(f"echo stderr: {echo_stderr}")
-
         start_cmd = [*prefix, "enroot", "start", "--rw", *env_options, *mount_options, name]
         if command:
             start_cmd += shlex.split(command) if isinstance(command, str) \
                          else list(command)
 
-        print(f"[Enroot] Starting command: {' '.join(start_cmd)}")
+        logger.debug("Starting command: %s", " ".join(start_cmd))
         process = subprocess.Popen(start_cmd,
                          stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL if not ENROOT_DEBUG else subprocess.PIPE,
@@ -912,6 +1012,11 @@ class Containers:
         self,
         **_,
     ) -> List[Container]:
+        """List containers known to ``enroot list``.
+
+        Returns:
+            A list of :class:`Container` objects for each running container name.
+        """
         names = list_containers_plain().keys()
         return [Container(self._cli, nm, {}, process=None) for nm in names]
 
@@ -919,6 +1024,17 @@ class Containers:
         self,
         ident: str,
     ) -> Container:
+        """Fetch a container by name.
+
+        Args:
+            ident: Container name (Enroot ID).
+
+        Returns:
+            A :class:`Container` for the requested name.
+
+        Raises:
+            errors.NotFound: If the container is not present in ``enroot list``.
+        """
         if ident not in list_containers_plain():
             raise errors.NotFound(f"Container {ident!r} not found")
         return Container(self._cli, ident, {}, process=None)

@@ -87,12 +87,30 @@ class _EnrootAPI:
 
 
 class EnrootClient:
+    """High-level entry point for working with Enroot.
+
+    Exposes helpers for working with images and containers, plus a small
+    Docker-compatible API surface.
+
+    Attributes:
+        images: ``Images`` helper for pulling and listing images.
+        containers: ``Containers`` helper for creating, starting and querying containers.
+        api: Docker-compatible API shim used by some integrations (for example, swebench).
+    """
     def __init__(self):
         self.images = Images(self)
         self.containers = Containers(self)
         self.api = _EnrootAPI(self)
 
     def ping(self) -> bool:
+        """Check whether the underlying Enroot CLI is reachable.
+
+        Returns:
+            True if ``enroot version`` completes successfully.
+
+        Raises:
+            errors.APIError: If invoking the Enroot CLI fails.
+        """
         try:
             run_enroot(["version"])
             return True
@@ -100,8 +118,18 @@ class EnrootClient:
             raise errors.APIError(str(e)) from e
 
     def close(self):
+        """Close the client.
+
+        This is currently a no-op and exists for API compatibility with docker-py
+        style clients.
+        """
         pass
 
 
 def from_env() -> EnrootClient:
+    """Construct an ``EnrootClient`` using environment configuration.
+
+    Returns:
+        A new :class:`EnrootClient` instance.
+    """
     return EnrootClient()

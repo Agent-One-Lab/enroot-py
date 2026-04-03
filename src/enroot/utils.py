@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import re
 import shlex
@@ -11,6 +12,8 @@ import warnings
 from typing import List, Optional, Dict, Any
 
 from . import errors
+
+logger = logging.getLogger("enroot.utils")
 
 
 def systemd_prefix(cpus: Optional[float], mem: Optional[str | int]) -> List[str]:
@@ -290,5 +293,5 @@ def clear_enroot_containers() -> None:
     containers = parse_list(run_enroot(["list"], capture=True))
     for name in containers:
         run_enroot(["remove", "--force", name], capture=False)
-    print("Cleared all enroot containers")
+    logger.info("Cleared all enroot containers")
 
