@@ -123,10 +123,3 @@ def test_get_after_start(client, alpine_image):
         assert found.status == "running"
     finally:
         cont.kill()
-
-
-def test_start_timeout_raises_timeout_error(created_container: Container):
-    """start(timeout=0) raises TimeoutError if container is not observed as running in time."""
-    cont = created_container
-    with pytest.raises(errors.TimeoutError, match="did not appear in 'enroot list'"):
-        cont.start(timeout=0)

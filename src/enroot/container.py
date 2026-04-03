@@ -1,13 +1,17 @@
 from typing import List, Dict, Any, TYPE_CHECKING, Union, BinaryIO, Tuple
+import asyncio
 from .utils import (
     run_enroot,
-    parse_list,
-    list_containers_plain,
+    run_enroot_async,
     list_containers_fancy,
+    list_containers_fancy_async,
+    list_containers_plain,
+    list_containers_plain_async,
     systemd_prefix,
     random_name,
     allocate_free_port,
     mem_limit_to_bytes,
+    _host_argv_with_timeout,
 )
 if TYPE_CHECKING:
     from .client import EnrootClient
@@ -17,9 +21,8 @@ from .image import pull_image
 import shlex
 import subprocess
 import time
-import pathlib
 from dataclasses import dataclass
-from .config import ENROOT_HOME, ENROOT_DEBUG
+from .config import ENROOT_DEBUG
 from . import errors
 import logging
 
@@ -45,6 +48,10 @@ class ExecResult:
         return 2
 
 class Container:
+    # Class-wide cache to reduce repeated `enroot list` pressure.
+    # Keyed by container name (enroot uses name as container id).
+    _PID_CACHE: Dict[str, List[int]] = {}
+
     def __init__(self, cli: "EnrootClient", name: str,
                  port_map: Dict[str, str], process=None,
                  _created_only: bool = False, _image_id: str | None = None,
@@ -71,10 +78,30 @@ class Container:
             self.reload()
 
     def _meta(self):
+        cached = self._PID_CACHE.get(self.name)
+        if cached is not None:
+            return {"pids": list(cached)}
+
         # Use fast plain list first; only call slow list --fancy when container is present
         if self.name not in list_containers_plain():
+            self._PID_CACHE.pop(self.name, None)
             return {}
-        return list_containers_fancy().get(self.name, {})
+        meta = list_containers_fancy().get(self.name, {})
+        pids = meta.get("pids", []) or []
+        if pids:
+            self._PID_CACHE[self.name] = list(pids)
+        else:
+            self._PID_CACHE.pop(self.name, None)
+        return meta
+
+    async def _meta_async(self):
+        """Async variant of _meta() using async list helpers."""
+        names = await list_containers_plain_async()
+        if self.name not in names:
+            return {}
+        return (
+            await list_containers_fancy_async()
+        ).get(self.name, {})
 
     @property
     def id(self) -> str:
@@ -112,11 +139,16 @@ class Container:
         finally:
             self._process = None
         run_enroot(["remove", "--force", self.name], capture=False)
+        self._PID_CACHE.pop(self.name, None)
         self._status = "exited"
 
     def reload(self):
         meta = self._meta()
         self.pids = meta.get("pids", [])
+        if self.pids:
+            self._PID_CACHE[self.name] = list(self.pids)
+        else:
+            self._PID_CACHE.pop(self.name, None)
         running = bool(self.pids) or bool(meta)
         # Preserve "created" when container was never started (not in list).
         if not meta and self._attrs.get("State", {}).get("Status") == "created":
@@ -194,11 +226,15 @@ class Container:
             finally:
                 self._process = None
         run_enroot(["remove", "--force", self.name], capture=False)
+        self._PID_CACHE.pop(self.name, None)
         self._status = "exited"
 
     def remove(self, force: bool = False, **_):
-        run_enroot(["remove", "--force" if force else "", self.name],
-                    capture=False)
+        cmd = ["remove", self.name]
+        if force:
+            cmd.insert(1, "--force")
+        run_enroot(cmd, capture=False)
+        self._PID_CACHE.pop(self.name, None)
         self._status = "exited"
 
     def start(self, command=None, environment=None,
@@ -208,7 +244,11 @@ class Container:
               cpus: float | None = None,
               timeout: int = 30,
               **_):
-        """Start this container. Similar to docker start. Use after create()."""
+        """Start this container. Similar to docker start. Use after create().
+
+        If neither ``command`` nor the stored create-time command is set, ``enroot start``
+        uses the image default (same idea as Docker CMD/ENTRYPOINT).
+        """
         command = command if command is not None else getattr(self, "_start_command", None)
         env_options = []
         environment = environment or {}
@@ -238,10 +278,18 @@ class Container:
         )
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if process.poll() is not None and process.returncode != 0:
-                raise errors.APIError(
-                    f"Container '{self.name}' failed to start (exit {process.returncode})."
-                )
+            polled = process.poll()
+            if polled is not None:
+                if process.returncode != 0:
+                    raise errors.APIError(
+                        f"Container '{self.name}' failed to start (exit {process.returncode})."
+                    )
+                # start command completed cleanly; for short-lived commands the container may
+                # never appear in `enroot list` by the time we poll. Treat as successful start.
+                self._process = None
+                self._created_only = False
+                self.reload()
+                return
             names = list_containers_plain()
             if self.name in names:
                 meta = list_containers_fancy().get(self.name, {})
@@ -255,6 +303,11 @@ class Container:
             raise errors.APIError(
                 f"Container '{self.name}' failed to start (exit {process.returncode})."
             )
+        if process.poll() is not None and process.returncode == 0:
+            self._process = None
+            self._created_only = False
+            self.reload()
+            return
         raise errors.TimeoutError(
             f"Container '{self.name}' did not appear in 'enroot list' within {timeout}s."
         )
@@ -270,6 +323,7 @@ class Container:
         environment: dict | None = None,
         detach: bool = False,
         mem_limit: str | int | None = None,
+        timeout: float | None = None,
         **_,
     ) -> ExecResult:
         """
@@ -283,6 +337,10 @@ class Container:
         applies to the whole ``enroot exec`` process (RLIMIT_AS).
         Accepts int bytes or strings like ``512m``, ``1g`` (see mem_limit_to_bytes).
         Requires ``prlimit`` (util-linux) in PATH on the host.
+
+        timeout, if set (seconds), wraps the full host ``enroot exec`` / ``srun`` command line with
+        the shell ``timeout`` utility (same mechanism as ``run_enroot``) so the process tree is signaled
+        on expiry. Exit code 124 raises :class:`errors.TimeoutError`. Ignored when ``detach=True``.
 
         Reload (list/fancy) is only run when pids are not already cached, so repeated exec_run
         calls avoid extra list overhead. If the container was restarted outside this client,
@@ -317,6 +375,10 @@ class Container:
                 if shutil.which("prlimit") is None:
                     raise errors.APIError("mem_limit requires prlimit in PATH (util-linux)")
                 exec_cmd = ["prlimit", f"--as={as_bytes}", "--", *exec_cmd]
+        if timeout is not None and not detach:
+            exec_cmd = _host_argv_with_timeout(exec_cmd, timeout)
+        elif timeout is not None and detach:
+            logger.warning("exec_run: timeout= is ignored when detach=True")
         if detach:
             subprocess.Popen(
                 exec_cmd,
@@ -332,11 +394,269 @@ class Container:
         )
         out_b = proc.stdout or b""
         err_b = proc.stderr or b""
+        rc = proc.returncode if proc.returncode is not None else 0
+        if timeout is not None and rc == 124:
+            raise errors.TimeoutError(f"exec_run timed out after {timeout}s")
         if demux:
             output = (out_b, err_b)
         else:
             output = out_b + (b"\n" if out_b and err_b else b"") + err_b
-        return ExecResult(exit_code=proc.returncode or 0, output=output)
+        return ExecResult(exit_code=rc, output=output)
+
+    async def reload_async(self):
+        """Async variant of reload() that avoids blocking list calls."""
+        meta = await self._meta_async()
+        self.pids = meta.get("pids", [])
+        if self.pids:
+            self._PID_CACHE[self.name] = list(self.pids)
+        else:
+            self._PID_CACHE.pop(self.name, None)
+        running = bool(self.pids) or bool(meta)
+        if not meta and self._attrs.get("State", {}).get("Status") == "created":
+            self._status = "created"
+            self._attrs.setdefault("State", {})["Running"] = False
+            return
+        self._status = "running" if running else "exited"
+        if "NetworkSettings" not in self._attrs:
+            self._attrs["NetworkSettings"] = {"Ports": {}}
+        self._attrs["NetworkSettings"]["Ports"] = {
+            c: [{"HostIp": "127.0.0.1", "HostPort": h}]
+            for c, h in self._port_map.items()
+        }
+        if "State" not in self._attrs:
+            self._attrs["State"] = {}
+        self._attrs["State"]["Status"] = self._status
+        self._attrs["State"]["Running"] = running
+
+    async def kill_async(self, timeout: int = 10, **_):
+        """
+        Async version of :meth:`kill`.
+
+        Best-effort async cleanup.
+
+        In practice, the container may have been started via either sync ``start()``
+        (so :attr:`_process` is a ``subprocess.Popen``) or async ``start_async()``
+        (so :attr:`_process` is an ``asyncio.subprocess.Process``).
+        """
+        if self._process is not None:
+            proc = self._process
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            loop = asyncio.get_running_loop()
+            try:
+                if isinstance(proc, asyncio.subprocess.Process):
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        await proc.wait()
+                else:
+                    # subprocess.Popen.wait(timeout=...) blocks in a worker thread.
+                    try:
+                        await loop.run_in_executor(None, proc.wait, timeout)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        await loop.run_in_executor(None, proc.wait)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                self._process = None
+
+        # Best-effort removal (mirrors kill() semantics).
+        await run_enroot_async(
+            ["remove", "--force", self.name],
+            capture=False,
+            check=False,
+        )
+        self._PID_CACHE.pop(self.name, None)
+        self._status = "exited"
+
+    async def start_async(
+        self,
+        command=None,
+        environment=None,
+        mount=None,
+        cpu_count: float | None = None,
+        mem_limit: str | int | None = None,
+        cpus: float | None = None,
+        timeout: int = 30,
+        **_,
+    ):
+        """Async version of :meth:`start` (non-blocking polling, same semantics)."""
+        command = command if command is not None else getattr(self, "_start_command", None)
+        env_options = []
+        environment = environment or {}
+        for key, value in environment.items():
+            env_options.extend(["--env", f"{key}={value}"])
+        if self._port_map:
+            host_port = next(iter(self._port_map.values()))
+            env_options.extend(["--env", f"PORT={host_port}"])
+        mount_options = []
+        mount = mount or {}
+        for path, options in mount.items():
+            mount_options.extend(["--mount", f"{path}:{options}"])
+        prefix = systemd_prefix(
+            cpu_count if cpu_count is not None else cpus,
+            mem_limit,
+        )
+        start_cmd = [*prefix, "enroot", "start", "--rw", *env_options, *mount_options, self.name]
+        if command:
+            start_cmd += shlex.split(command) if isinstance(command, str) else list(command)
+
+        process = await asyncio.create_subprocess_exec(
+            *start_cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL if not ENROOT_DEBUG else asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL if not ENROOT_DEBUG else asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                if process.returncode is not None:
+                    if process.returncode != 0:
+                        raise errors.APIError(
+                            f"Container '{self.name}' failed to start (exit {process.returncode})."
+                        )
+                    self._process = None
+                    self._created_only = False
+                    await self.reload_async()
+                    return
+
+                names = await list_containers_plain_async()
+                if self.name in names:
+                    meta = (
+                        await list_containers_fancy_async()
+                    ).get(self.name, {})
+                    if meta.get("pids"):
+                        self._process = process
+                        self._created_only = False
+                        await self.reload_async()
+                        return
+                await asyncio.sleep(0.1)
+
+            if process.returncode is not None and process.returncode != 0:
+                raise errors.APIError(
+                    f"Container '{self.name}' failed to start (exit {process.returncode})."
+                )
+            if process.returncode is not None and process.returncode == 0:
+                self._process = None
+                self._created_only = False
+                await self.reload_async()
+                return
+            raise errors.TimeoutError(
+                f"Container '{self.name}' did not appear in 'enroot list' within {timeout}s."
+            )
+        except asyncio.CancelledError:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                await process.wait()
+            except Exception:
+                pass
+            self._process = None
+            raise
+
+    async def exec_run_async(
+        self,
+        cmd: str | List[str],
+        stdout: bool = True,
+        stderr: bool = True,
+        demux: bool = False,
+        workdir: str | None = None,
+        user: str | None = None,
+        environment: dict | None = None,
+        detach: bool = False,
+        mem_limit: str | int | None = None,
+        timeout: float | None = None,
+        **_,
+    ) -> ExecResult:
+        """Async version of :meth:`exec_run`."""
+        if user is not None:
+            logger.warning(
+                f"Enroot Container: user= is accepted for API compatibility but has no effect: {user}"
+            )
+        if not self.pids:
+            await self.reload_async()
+        if not self.pids:
+            raise errors.APIError("Container is not running")
+
+        ident = str(self.pids[0])
+        if isinstance(cmd, str):
+            cmd = shlex.split(cmd)
+        if workdir or environment:
+            parts = []
+            if environment:
+                for k, v in environment.items():
+                    parts.append(f"export {k}={shlex.quote(str(v))}")
+            if workdir:
+                parts.append(f"cd {shlex.quote(workdir)}")
+            run_cmd = " ".join(shlex.quote(c) for c in cmd)
+            shell_cmd = (" && ".join(parts) + " && " + run_cmd) if parts else run_cmd
+            cmd = ["sh", "-c", shell_cmd]
+
+        exec_cmd: List[str] = ["enroot", "exec", ident, *cmd]
+        if mem_limit is not None:
+            try:
+                as_bytes = mem_limit_to_bytes(mem_limit)
+            except ValueError as e:
+                raise errors.APIError(str(e)) from e
+            if as_bytes > 0:
+                if shutil.which("prlimit") is None:
+                    raise errors.APIError("mem_limit requires prlimit in PATH (util-linux)")
+                exec_cmd = ["prlimit", f"--as={as_bytes}", "--", *exec_cmd]
+
+        if timeout is not None and not detach:
+            exec_cmd = _host_argv_with_timeout(exec_cmd, timeout)
+        elif timeout is not None and detach:
+            logger.warning("exec_run: timeout= is ignored when detach=True")
+
+        if detach:
+            proc = await asyncio.create_subprocess_exec(
+                *exec_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            _ = proc
+            return ExecResult(exit_code=0, output=b"")
+
+        stdout_opt = asyncio.subprocess.PIPE if stdout else asyncio.subprocess.DEVNULL
+        stderr_opt = asyncio.subprocess.PIPE if stderr else asyncio.subprocess.DEVNULL
+        proc = await asyncio.create_subprocess_exec(
+            *exec_cmd,
+            stdout=stdout_opt,
+            stderr=stderr_opt,
+        )
+        try:
+            out_b, err_b = await proc.communicate()
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
+
+        out_b = out_b or b""
+        err_b = err_b or b""
+        rc = proc.returncode if proc.returncode is not None else 0
+        if timeout is not None and rc == 124:
+            raise errors.TimeoutError(f"exec_run timed out after {timeout}s")
+
+        if demux:
+            output = (out_b, err_b)
+        else:
+            output = out_b + (b"\n" if out_b and err_b else b"") + err_b
+        return ExecResult(exit_code=rc, output=output)
 
     def logs(self, **_) -> bytes:
         return b""
@@ -370,7 +690,7 @@ class Containers:
         name = name or random_name()
 
         # Check if a container with this name is running
-        if name in parse_list(run_enroot(["list"], capture=True)):
+        if name in list_containers_plain():
             raise errors.APIError(f"A container with name '{name}' is already running.")
 
         try:
@@ -437,17 +757,36 @@ class Containers:
 
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if process.poll() is not None and process.returncode != 0:
-                raise errors.APIError(
-                    f"Container '{name}' failed to start (exit {process.returncode})\n"
-                    f"stderr: {process.stderr.read().strip() if process.stderr else ''}\n"
-                    f"stdout: {process.stdout.read().strip() if process.stdout else ''}"
+            polled = process.poll()
+            if polled is not None:
+                if process.returncode != 0:
+                    raise errors.APIError(
+                        f"Container '{name}' failed to start (exit {process.returncode})\n"
+                        f"stderr: {process.stderr.read().strip() if process.stderr else ''}\n"
+                        f"stdout: {process.stdout.read().strip() if process.stdout else ''}"
+                    )
+                # For short-lived commands (`run(..., detach=True, command='echo hi')`),
+                # process may finish before list polling observes a running container.
+                c = Container(
+                    self._cli,
+                    name,
+                    port_map,
+                    process=None,
+                    _image_id=img.id,
                 )
+                c.reload()
+                return c
             names = list_containers_plain()
             if name in names:
                 container_info = list_containers_fancy().get(name, {})
                 if container_info.get("pids"):
-                    return Container(self._cli, name, port_map, process=process, _image_id=img.id)
+                    return Container(
+                        self._cli,
+                        name,
+                        port_map,
+                        process=process,
+                        _image_id=img.id,
+                    )
             time.sleep(0.5)
 
         # Container did not appear within deadline
@@ -455,7 +794,17 @@ class Containers:
             raise errors.APIError(
                 f"Container '{name}' failed to start (exit {process.returncode})."
             )
-        raise errors.APIError(
+        if process.poll() is not None and process.returncode == 0:
+            c = Container(
+                self._cli,
+                name,
+                port_map,
+                process=None,
+                _image_id=img.id,
+            )
+            c.reload()
+            return c
+        raise errors.TimeoutError(
             f"Container '{name}' did not appear in 'enroot list' within {timeout}s. "
             "Check 'enroot start' or 'enroot list --fancy' output."
         )
@@ -463,10 +812,17 @@ class Containers:
     def create(self, image, command=None, name=None, ports=None, mount=None,
                environment=None, cpu_count: float | None = None,
                mem_limit: str | int | None = None, cpus: float | None = None,
+               timeout: float | None = 120,
                **_):
-        """Create a container without starting it. Similar to docker create."""
+        """Create a container without starting it. Similar to docker create.
+
+        ``timeout`` limits how long ``enroot create`` may run in seconds (including under Slurm).
+        It is implemented via ``run_enroot`` (see ``enroot.utils``) using the shell ``timeout`` utility so the host
+        ``enroot`` / ``srun`` process tree is signaled on expiry (not only a Python subprocess
+        timeout). Pass ``None`` for no limit. Raises :class:`errors.TimeoutError` when the limit is exceeded.
+        """
         name = name or random_name()
-        if name in parse_list(run_enroot(["list"], capture=True)):
+        if name in list_containers_plain():
             raise errors.APIError(f"A container with name '{name}' is already running.")
         try:
             img = pull_image(image) if isinstance(image, str) else image
@@ -475,7 +831,13 @@ class Containers:
         except Exception as e:
             raise errors.APIError(str(e)) from e
         try:
-            run_enroot(["create", "--name", name, img.id], check=True)
+            run_enroot(
+                ["create", "--name", name, img.id],
+                check=True,
+                timeout=timeout,
+            )
+        except errors.TimeoutError:
+            raise
         except RuntimeError as e:
             raise errors.APIError(str(e)) from e
         ports = ports or {}
@@ -490,11 +852,73 @@ class Containers:
             _start_command=command,
         )
 
-    def list(self, **_) -> List[Container]:
-        names = parse_list(run_enroot(["list"])).keys()
-        return [Container(self._cli, nm, {}) for nm in names]
+    async def create_async(
+        self,
+        image,
+        command=None,
+        name=None,
+        ports=None,
+        mount=None,
+        environment=None,
+        cpu_count: float | None = None,
+        mem_limit: str | int | None = None,
+        cpus: float | None = None,
+        timeout: float | None = 120,
+        **_,
+    ) -> Container:
+        """Async version of :meth:`create`."""
+        _ = mount, environment, cpu_count, mem_limit, cpus  # create() currently ignores these
+        name = name or random_name()
+        exists = name in await list_containers_plain_async()
+        if exists:
+            raise errors.APIError(f"A container with name '{name}' is already running.")
 
-    def get(self, ident: str) -> Container:
-        if ident not in parse_list(run_enroot(["list"])):
+        try:
+            img = pull_image(image) if isinstance(image, str) else image
+        except errors.ImageNotFound:
+            raise
+        except Exception as e:
+            raise errors.APIError(str(e)) from e
+
+        try:
+            await run_enroot_async(
+                ["create", "--name", name, img.id],
+                check=True,
+                timeout=timeout,
+            )
+        except errors.TimeoutError:
+            raise
+        except RuntimeError as e:
+            raise errors.APIError(str(e)) from e
+
+        ports = ports or {}
+        port_map = {f"{p.split('/')[0]}/tcp": p.split('/')[0] for p in ports}
+        if port_map:
+            free_port = allocate_free_port()
+            for k in port_map:
+                port_map[k] = free_port
+
+        return Container(
+            self._cli,
+            name,
+            port_map,
+            process=None,
+            _created_only=True,
+            _image_id=img.id,
+            _start_command=command,
+        )
+
+    def list(
+        self,
+        **_,
+    ) -> List[Container]:
+        names = list_containers_plain().keys()
+        return [Container(self._cli, nm, {}, process=None) for nm in names]
+
+    def get(
+        self,
+        ident: str,
+    ) -> Container:
+        if ident not in list_containers_plain():
             raise errors.NotFound(f"Container {ident!r} not found")
-        return Container(self._cli, ident, {})
+        return Container(self._cli, ident, {}, process=None)

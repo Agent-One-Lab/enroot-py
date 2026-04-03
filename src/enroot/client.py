@@ -3,7 +3,7 @@ import subprocess
 import uuid
 from .container import Containers
 from .image import Images
-from .utils import run_enroot, parse_list
+from .utils import run_enroot
 from . import errors
 
 
@@ -41,7 +41,9 @@ class _EnrootAPI:
         )
         if not stream:
             out, err = proc.communicate()
-            return out + (b"\n" if err else b"") + (err or b"")
+            err = err or b""
+            _rc = proc.returncode if proc.returncode is not None else 0
+            return out + (b"\n" if err else b"") + err
         # Stream: yield chunks until done
         while True:
             chunk = proc.stdout.read(4096)  # type: ignore[union-attr]

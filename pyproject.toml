@@ -24,3 +24,8 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: pulls large images or long-running integration checks",
+]

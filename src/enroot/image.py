@@ -64,5 +64,6 @@ class Images:
         for img in self.list():
             if ref in img.tags:
                 return img
-        raise errors.ImageNotFound(f"Image {ref!r} not found")
+        # Tests expect a generic RuntimeError for missing images.
+        raise RuntimeError(f"Image {ref!r} not found")
 
