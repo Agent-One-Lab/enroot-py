@@ -11,7 +11,7 @@ import uuid
 import warnings
 from typing import List, Optional, Dict, Any
 
-from . import errors
+from .. import errors
 
 logger = logging.getLogger("enroot.utils")
 
@@ -243,7 +243,7 @@ def run_enroot(
     If the command exits non-zero and `check=True`, raises RuntimeError. If `timeout` is provided,
     wraps the host argv in shell `timeout` and maps exit code 124 to errors.TimeoutError.
     """
-    from .config import ENROOT_ASYNC
+    from ..config import ENROOT_ASYNC
 
     if ENROOT_ASYNC:
         try:

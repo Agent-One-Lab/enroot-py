@@ -3,6 +3,7 @@ import shutil
 
 import pytest
 
+from enroot import errors
 from enroot.container import Container
 
 
@@ -67,11 +68,13 @@ def test_exec_run_mem_limit_rejects_oversized_allocation(
 ):
     """RLIMIT_AS caps address space: a huge allocation fails under a small limit."""
     cmd = _oversized_alloc_cmd(alloc_interpreter)
-    r = ubuntu_container.exec_run(cmd, mem_limit="64m")
-    print(f"test_exec_run_mem_limit_rejects_oversized_allocation: {r.output}")
-    assert r.exit_code != 0, r.output
-    assert b"No such file" not in r.output
-    assert b"failed to execute" not in r.output
+    with pytest.raises(errors.MemoryError) as excinfo:
+        ubuntu_container.exec_run(cmd, mem_limit="64m")
+    err = excinfo.value
+    assert err.exit_code not in (0, None)
+    out = (err.stderr or b"").decode("utf-8", errors="replace")
+    assert "No such file" not in out
+    assert "failed to execute" not in out
 
 
 @requires_prlimit

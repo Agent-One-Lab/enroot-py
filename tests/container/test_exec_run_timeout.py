@@ -3,14 +3,13 @@ import time
 
 import pytest
 
-from enroot import errors
 from enroot.container import Container
 
 
 def test_exec_run_timeout_stops_long_sleep(running_container: Container):
     """Long sleep is cut short by host ``timeout`` wrapping the full exec (not ~60s)."""
     t0 = time.monotonic()
-    with pytest.raises(errors.TimeoutError, match="exec_run timed out"):
+    with pytest.raises(TimeoutError, match="exec_run timed out"):
         running_container.exec_run(["sleep", "60"], timeout=2)
     elapsed = time.monotonic() - t0
     assert elapsed < 15, f"expected quick return, took {elapsed:.1f}s"

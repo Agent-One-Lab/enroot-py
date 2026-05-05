@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, TYPE_CHECKING, Union, BinaryIO, Tuple
 import asyncio
+import builtins
 from .utils import (
     run_enroot,
     run_enroot_async,
@@ -16,6 +17,7 @@ from .utils import (
 if TYPE_CHECKING:
     from .client import EnrootClient
 import os
+import re
 import shutil
 from .image import pull_image
 import shlex
@@ -27,6 +29,49 @@ from . import errors
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# SIGABRT (6), SIGBUS (7), SIGSEGV (11) — plausible RLIMIT_AS / allocator crashes, not SIGTERM etc.
+_MEMORY_RELATED_SIGNALS = frozenset((6, 7, 11))
+
+
+def _host_exit_suggests_memory_related_signal(rc: int) -> bool:
+    """True only for memory-ish signal deaths, not SIGPIPE/SIGTERM/SIGHUP (141/143/129, …)."""
+    if rc < 0:
+        return -rc in _MEMORY_RELATED_SIGNALS
+    if rc >= 128:
+        return (rc - 128) in _MEMORY_RELATED_SIGNALS
+    return False
+
+
+# Tight regexes: avoid matching incidental text (e.g. “not out of memory”) or random “enomem” paths.
+_OUTPUT_MEMORY_PATTERNS = (
+    # Python traceback line
+    re.compile(rb"(?im)^\s*MemoryError\s*:"),
+    re.compile(rb"\bstd::bad_alloc\b"),
+    re.compile(rb"(?i)\bbad allocation\b"),
+    # libc / Perl often emit these at line start
+    re.compile(rb"(?im)^\s*out of memory[!.\s]"),
+    re.compile(rb"(?i)\bcannot allocate memory\b"),
+    re.compile(rb"(?im)^\s*segmentation fault\s*$"),
+    re.compile(rb"(?i)\berrno\s*=\s*enomem\b"),
+)
+
+
+def _output_suggests_memory_resource_exhaustion(out_b: bytes, err_b: bytes) -> bool:
+    if not out_b and not err_b:
+        return False
+    blob = out_b + b"\n" + err_b
+    return any(p.search(blob) for p in _OUTPUT_MEMORY_PATTERNS)
+
+
+def _should_raise_prlimit_memory_error(rc: int, out_b: bytes, err_b: bytes) -> bool:
+    if rc in (0, 124, 137, 139):
+        return False
+    return _host_exit_suggests_memory_related_signal(rc) or _output_suggests_memory_resource_exhaustion(
+        out_b, err_b
+    )
+
 
 @dataclass
 class ExecResult:
@@ -379,6 +424,8 @@ class Container:
         environment: dict | None = None,
         detach: bool = False,
         mem_limit: str | int | None = None,
+        mem_guard_limit: str | int | None = None,
+        mem_guard_poll_interval: float = 1.0,
         timeout: float | None = None,
         **_,
     ) -> ExecResult:
@@ -394,9 +441,25 @@ class Container:
         Accepts int bytes or strings like ``512m``, ``1g`` (see mem_limit_to_bytes).
         Requires ``prlimit`` (util-linux) in PATH on the host.
 
-        timeout, if set (seconds), wraps the full host ``enroot exec`` / ``srun`` command line with
-        the shell ``timeout`` utility (same mechanism as ``run_enroot``) so the process tree is signaled
-        on expiry. Exit code 124 raises :class:`errors.TimeoutError`. Ignored when ``detach=True``.
+        mem_guard_limit, if set, wraps the host command (after any ``prlimit`` / ``timeout`` shell) and
+        monitors the **total RSS** of the spawned process tree via ``psutil``. If the running
+        workload exceeds the RSS cap, the tree is killed and raises :class:`errors.MemGuardError`
+        (host exit 137). Requires ``psutil``.
+
+        Invalid arguments or missing host tools (``prlimit``, ``psutil``) raise :class:`errors.APIError`.
+        After the command runs, classification is in this order: host exit **124** → built-in
+        :exc:`TimeoutError`; **137** when ``mem_guard_limit`` is set → :class:`errors.MemGuardError`
+        (RSS cap); else if ``mem_limit`` applied a positive ``prlimit --as`` and the outcome looks
+        like an address-space / allocation failure (host exit **134**/**135**/**139** from
+        SIGABRT/SIGBUS/SIGSEGV, matching negative subprocess return codes, or stdout/stderr matching
+        a small set of allocator / traceback patterns) →
+        :class:`errors.MemoryError`. Ordinary tool failures (e.g. ``grep`` exit **1**) return
+        :class:`ExecResult` with that exit code. You can set **both** ``mem_limit`` and
+        ``mem_guard_limit``: plausible RLIMIT failures surface as ``MemoryError``, RSS kills as
+        ``MemGuardError``.
+
+        timeout, if set (seconds), wraps the full host ``enroot exec`` command line with the shell
+        ``timeout`` utility. Ignored when ``detach=True``.
 
         Reload (list/fancy) is only run when pids are not already cached, so repeated exec_run
         calls avoid extra list overhead. If the container was restarted outside this client,
@@ -422,19 +485,24 @@ class Container:
             shell_cmd = (" && ".join(parts) + " && " + run_cmd) if parts else run_cmd
             cmd = ["sh", "-c", shell_cmd]
         exec_cmd = ["enroot", "exec", ident, *cmd]
+        prlimit_as_bytes: int | None = None
         if mem_limit is not None:
             try:
-                as_bytes = mem_limit_to_bytes(mem_limit)
+                prlimit_as_bytes = mem_limit_to_bytes(mem_limit)
             except ValueError as e:
                 raise errors.APIError(str(e)) from e
-            if as_bytes > 0:
+            if prlimit_as_bytes and prlimit_as_bytes > 0:
                 if shutil.which("prlimit") is None:
-                    raise errors.APIError("mem_limit requires prlimit in PATH (util-linux)")
-                exec_cmd = ["prlimit", f"--as={as_bytes}", "--", *exec_cmd]
+                    raise errors.APIError(
+                        "mem_limit requires prlimit in PATH (util-linux)"
+                    )
+                exec_cmd = ["prlimit", f"--as={prlimit_as_bytes}", "--", *exec_cmd]
         if timeout is not None and not detach:
             exec_cmd = _host_argv_with_timeout(exec_cmd, timeout)
         elif timeout is not None and detach:
             logger.warning("exec_run: timeout= is ignored when detach=True")
+        if mem_guard_limit is not None and detach:
+            logger.warning("exec_run: mem_guard_limit= is ignored when detach=True")
         if detach:
             subprocess.Popen(
                 exec_cmd,
@@ -443,16 +511,61 @@ class Container:
                 stderr=subprocess.DEVNULL,
             )
             return ExecResult(exit_code=0, output=b"")
-        proc = subprocess.run(
-            exec_cmd,
-            stdout=subprocess.PIPE if stdout else subprocess.DEVNULL,
-            stderr=subprocess.PIPE if stderr else subprocess.DEVNULL,
-        )
-        out_b = proc.stdout or b""
-        err_b = proc.stderr or b""
-        rc = proc.returncode if proc.returncode is not None else 0
+
+        if mem_guard_limit is not None:
+            try:
+                from .utils.mem_guard import run_guarded_capture
+            except ImportError as e:
+                raise errors.APIError(
+                    "mem_guard_limit requires psutil; pip install psutil"
+                ) from e
+            try:
+                mg_bytes = mem_limit_to_bytes(mem_guard_limit)
+            except ValueError as e:
+                raise errors.APIError(str(e)) from e
+            if mg_bytes <= 0:
+                raise errors.APIError("mem_guard_limit must be a positive size")
+            rc, out_b, err_b = run_guarded_capture(
+                exec_cmd,
+                mem_limit=mg_bytes,
+                poll_interval=float(mem_guard_poll_interval),
+                grace_kills=True,
+                capture_stdout=stdout,
+                capture_stderr=stderr,
+            )
+        else:
+            proc = subprocess.run(
+                exec_cmd,
+                stdout=subprocess.PIPE if stdout else subprocess.DEVNULL,
+                stderr=subprocess.PIPE if stderr else subprocess.DEVNULL,
+            )
+            out_b = proc.stdout or b""
+            err_b = proc.stderr or b""
+            rc = proc.returncode if proc.returncode is not None else 0
+
         if timeout is not None and rc == 124:
             raise errors.TimeoutError(f"exec_run timed out after {timeout}s")
+        if mem_guard_limit is not None and rc == 137:
+            combined = out_b + (b"\n" if out_b and err_b else b"") + err_b
+            raise errors.MemGuardError(
+                "exec_run exceeded mem_guard_limit (RSS); process tree was killed",
+                exit_code=137,
+                output=combined,
+                stdout=out_b,
+                stderr=err_b,
+            )
+        if (
+            prlimit_as_bytes is not None
+            and prlimit_as_bytes > 0
+            and _should_raise_prlimit_memory_error(rc, out_b, err_b)
+        ):
+            detail = err_b.decode("utf-8", errors="replace").strip() or "(no stderr)"
+            raise errors.MemoryError(
+                f"prlimit-wrapped exec failed (exit {rc}): {detail[:2000]}",
+                exit_code=rc,
+                stderr=err_b,
+            )
+
         if demux:
             output = (out_b, err_b)
         else:
@@ -654,10 +767,12 @@ class Container:
         environment: dict | None = None,
         detach: bool = False,
         mem_limit: str | int | None = None,
+        mem_guard_limit: str | int | None = None,
+        mem_guard_poll_interval: float = 1.0,
         timeout: float | None = None,
         **_,
     ) -> ExecResult:
-        """Async version of :meth:`exec_run`."""
+        """Async version of :meth:`exec_run` (including ``mem_guard_limit``)."""
         if user is not None:
             logger.warning(
                 f"Enroot Container: user= is accepted for API compatibility but has no effect: {user}"
@@ -681,21 +796,26 @@ class Container:
             shell_cmd = (" && ".join(parts) + " && " + run_cmd) if parts else run_cmd
             cmd = ["sh", "-c", shell_cmd]
 
-        exec_cmd: List[str] = ["enroot", "exec", ident, *cmd]
+        exec_cmd = ["enroot", "exec", ident, *cmd]
+        prlimit_as_bytes: int | None = None
         if mem_limit is not None:
             try:
-                as_bytes = mem_limit_to_bytes(mem_limit)
+                prlimit_as_bytes = mem_limit_to_bytes(mem_limit)
             except ValueError as e:
                 raise errors.APIError(str(e)) from e
-            if as_bytes > 0:
+            if prlimit_as_bytes and prlimit_as_bytes > 0:
                 if shutil.which("prlimit") is None:
-                    raise errors.APIError("mem_limit requires prlimit in PATH (util-linux)")
-                exec_cmd = ["prlimit", f"--as={as_bytes}", "--", *exec_cmd]
+                    raise errors.APIError(
+                        "mem_limit requires prlimit in PATH (util-linux)"
+                    )
+                exec_cmd = ["prlimit", f"--as={prlimit_as_bytes}", "--", *exec_cmd]
 
         if timeout is not None and not detach:
             exec_cmd = _host_argv_with_timeout(exec_cmd, timeout)
         elif timeout is not None and detach:
             logger.warning("exec_run: timeout= is ignored when detach=True")
+        if mem_guard_limit is not None and detach:
+            logger.warning("exec_run_async: mem_guard_limit= is ignored when detach=True")
 
         if detach:
             proc = await asyncio.create_subprocess_exec(
@@ -707,25 +827,71 @@ class Container:
             _ = proc
             return ExecResult(exit_code=0, output=b"")
 
-        stdout_opt = asyncio.subprocess.PIPE if stdout else asyncio.subprocess.DEVNULL
-        stderr_opt = asyncio.subprocess.PIPE if stderr else asyncio.subprocess.DEVNULL
-        proc = await asyncio.create_subprocess_exec(
-            *exec_cmd,
-            stdout=stdout_opt,
-            stderr=stderr_opt,
-        )
-        try:
-            out_b, err_b = await proc.communicate()
-        except asyncio.CancelledError:
-            proc.kill()
-            await proc.wait()
-            raise
+        if mem_guard_limit is not None:
+            try:
+                from .utils.mem_guard import MemGuard
+            except ImportError as e:
+                raise errors.APIError(
+                    "mem_guard_limit requires psutil; pip install psutil"
+                ) from e
+            try:
+                mg_bytes = mem_limit_to_bytes(mem_guard_limit)
+            except ValueError as e:
+                raise errors.APIError(str(e)) from e
+            if mg_bytes <= 0:
+                raise errors.APIError("mem_guard_limit must be a positive size")
+            guard = MemGuard(
+                mem_limit_bytes=mg_bytes,
+                poll_interval=float(mem_guard_poll_interval),
+            )
+            stdout_opt = asyncio.subprocess.PIPE if stdout else asyncio.subprocess.DEVNULL
+            stderr_opt = asyncio.subprocess.PIPE if stderr else asyncio.subprocess.DEVNULL
+            rc, out_b, err_b = await guard.run_capture(
+                exec_cmd,
+                stdout=stdout_opt,
+                stderr=stderr_opt,
+            )
+        else:
+            stdout_opt = asyncio.subprocess.PIPE if stdout else asyncio.subprocess.DEVNULL
+            stderr_opt = asyncio.subprocess.PIPE if stderr else asyncio.subprocess.DEVNULL
+            proc = await asyncio.create_subprocess_exec(
+                *exec_cmd,
+                stdout=stdout_opt,
+                stderr=stderr_opt,
+            )
+            try:
+                out_b, err_b = await proc.communicate()
+            except asyncio.CancelledError:
+                proc.kill()
+                await proc.wait()
+                raise
 
-        out_b = out_b or b""
-        err_b = err_b or b""
-        rc = proc.returncode if proc.returncode is not None else 0
+            out_b = out_b or b""
+            err_b = err_b or b""
+            rc = proc.returncode if proc.returncode is not None else 0
+
         if timeout is not None and rc == 124:
-            raise errors.TimeoutError(f"exec_run timed out after {timeout}s")
+            raise errors.TimeoutError(f"Command timed out after {timeout}s")
+        if mem_guard_limit is not None and rc == 137:
+            combined = out_b + (b"\n" if out_b and err_b else b"") + err_b
+            raise errors.MemGuardError(
+                "Command exceeded mem_guard_limit (RSS); process tree was killed",
+                exit_code=137,
+                output=combined,
+                stdout=out_b,
+                stderr=err_b,
+            )
+        if (
+            prlimit_as_bytes is not None
+            and prlimit_as_bytes > 0
+            and _should_raise_prlimit_memory_error(rc, out_b, err_b)
+        ):
+            detail = err_b.decode("utf-8", errors="replace").strip() or "(no stderr)"
+            raise errors.MemoryError(
+                f"Command failed (exit {rc}): {detail[:2000]}",
+                exit_code=rc,
+                stderr=err_b,
+            )
 
         if demux:
             output = (out_b, err_b)

@@ -3,7 +3,7 @@ import asyncio
 import pytest
 from enroot import config as enroot_config
 from enroot import errors
-from enroot import utils as enroot_utils
+import enroot.utils.utils as utils_impl
 from enroot.utils import (
     random_name,
     parse_list,
@@ -90,13 +90,13 @@ def test_run_enroot_timeout_exit_124_maps_to_errors_timeout(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(enroot_config, "ENROOT_ASYNC", False)
-    monkeypatch.setattr(enroot_utils.subprocess, "run", lambda *a, **k: FakeResult())
+    monkeypatch.setattr(utils_impl.subprocess, "run", lambda *a, **k: FakeResult())
     with pytest.raises(errors.TimeoutError, match="timed out"):
-        enroot_utils.run_enroot(["list"], timeout=5.0, check=True)
+        utils_impl.run_enroot(["list"], timeout=5.0, check=True)
 
 
 def test_host_argv_with_timeout_wraps_full_command():
-    w = enroot_utils._host_argv_with_timeout(["srun", "enroot", "list"], 3.5)
+    w = utils_impl._host_argv_with_timeout(["srun", "enroot", "list"], 3.5)
     assert w[0] == "sh" and w[1] == "-c"
     assert "timeout 4 sh -c" in w[2]
     assert "srun" in w[2] and "enroot" in w[2]
@@ -106,7 +106,7 @@ def test_list_containers_plain_async_uses_run_enroot_async(monkeypatch):
     async def fake_run_enroot_async(*args, **kwargs):
         return "c1\nc2\n"
 
-    monkeypatch.setattr(enroot_utils, "run_enroot_async", fake_run_enroot_async)
+    monkeypatch.setattr(utils_impl, "run_enroot_async", fake_run_enroot_async)
     out = asyncio.run(list_containers_plain_async())
     assert "c1" in out and "c2" in out
 
@@ -117,6 +117,6 @@ def test_list_containers_fancy_async_fallbacks_to_plain(monkeypatch):
             raise RuntimeError("fancy failed")
         return "plain-only\n"
 
-    monkeypatch.setattr(enroot_utils, "run_enroot_async", fake_run_enroot_async)
+    monkeypatch.setattr(utils_impl, "run_enroot_async", fake_run_enroot_async)
     out = asyncio.run(list_containers_fancy_async(retries=1, fallback_plain=True))
     assert "plain-only" in out
