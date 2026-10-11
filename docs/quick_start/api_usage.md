@@ -85,6 +85,15 @@ container.stop(timeout=5)
 container.remove(force=True)
 ```
 
+To sweep leftovers on the host in one go — e.g. containers a killed job never
+removed — filter by a naming prefix so you never touch anyone else's:
+
+```python
+from enroot import clear_enroot_containers
+
+removed = clear_enroot_containers(prefix="myapp-")  # None removes every container on the host
+```
+
 ## Notes
 
 - Resource-limit arguments passed to `containers.create(...)` are compatibility

@@ -12,6 +12,7 @@ from .utils import (
     random_name,
     allocate_free_port,
     mem_limit_to_bytes,
+    stop_process_groups,
     _host_argv_with_timeout,
 )
 if TYPE_CHECKING:
@@ -189,12 +190,9 @@ class Container:
             self._status = "exited"
             return
         try:
-            self._process.terminate()
+            stop_process_groups([self._process.pid], timeout=timeout)
             self._process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait()
-        except ProcessLookupError:
+        except (ProcessLookupError, subprocess.TimeoutExpired):
             pass
         finally:
             self._process = None
@@ -297,10 +295,11 @@ class Container:
         terminate the local start process (if tracked) and then remove the
         container via ``enroot remove --force``.
         """
-        # Stop the "enroot start" process first so remove can succeed.
+        # Stop the "enroot start" process and everything it started first, so remove can
+        # succeed and no orphan keeps the removed files open.
         if self._process is not None:
             try:
-                self._process.terminate()
+                stop_process_groups([self._process.pid], timeout=5)
                 self._process.wait(timeout=5)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
@@ -610,32 +609,16 @@ class Container:
         """
         if self._process is not None:
             proc = self._process
-            try:
-                proc.terminate()
-            except Exception:
-                pass
             loop = asyncio.get_running_loop()
             try:
+                # The whole process group: SIGTERM, SIGKILL after ``timeout`` (blocks, so off-loop).
+                await loop.run_in_executor(None, stop_process_groups, [proc.pid], timeout)
                 if isinstance(proc, asyncio.subprocess.Process):
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        await proc.wait()
+                    await asyncio.wait_for(proc.wait(), timeout=timeout)
                 else:
                     # subprocess.Popen.wait(timeout=...) blocks in a worker thread.
-                    try:
-                        await loop.run_in_executor(None, proc.wait, timeout)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        await loop.run_in_executor(None, proc.wait)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
+                    await loop.run_in_executor(None, proc.wait, timeout)
+            except (ProcessLookupError, subprocess.TimeoutExpired, asyncio.TimeoutError):
                 pass
             finally:
                 self._process = None

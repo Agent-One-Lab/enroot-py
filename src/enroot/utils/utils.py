@@ -1,15 +1,17 @@
 import asyncio
 import logging
 import math
+import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import time
 import uuid
 import warnings
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable, Set
 
 from .. import errors
 
@@ -289,9 +291,124 @@ def run_enroot(
     return (proc.stdout.strip() if capture and proc.stdout else "")
 
 
-def clear_enroot_containers() -> None:
-    containers = parse_list(run_enroot(["list"], capture=True))
-    for name in containers:
-        run_enroot(["remove", "--force", name], capture=False)
-    logger.info("Cleared all enroot containers")
+def _live_process_groups(pgids: Set[int]) -> Set[int]:
+    """The groups in ``pgids`` that still have a member that is not a zombie (reads ``/proc``)."""
+    live: Set[int] = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # "pid (comm) state ppid pgrp ..."; comm may contain spaces and parentheses.
+        fields = stat[stat.rfind(")") + 2:].split()
+        if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) in pgids:
+            live.add(int(fields[2]))
+    return live
+
+
+def container_process_groups(pids: Iterable[int]) -> Set[int]:
+    """The process groups to stop for containers whose processes are ``pids``.
+
+    Containers are started in a new session (``start_new_session=True``), so their
+    processes' group id equals their session id. Pids in any other group (a container
+    started some other way), in the caller's own session, gone, or owned by another
+    user are left out.
+    """
+    own_session = os.getsid(0)
+    groups: Set[int] = set()
+    for pid in pids:
+        try:
+            pgid, sid = os.getpgid(pid), os.getsid(pid)
+        except (ProcessLookupError, PermissionError):
+            continue
+        if pgid == sid and sid != own_session:
+            groups.add(pgid)
+    return groups
+
+
+def stop_process_groups(pgids: Iterable[int], timeout: float = 10.0) -> None:
+    """Stop whole process groups: SIGTERM, then SIGKILL whatever is alive after ``timeout`` seconds.
+
+    A container's ``enroot start`` process is its init process and leads its own
+    session and process group. Servers the container's command starts in the
+    background stay in that group, so signalling only the init process leaves them
+    running as orphans that keep the container's files open even after
+    ``enroot remove``. Signalling the group stops them too, even when the init
+    process has already exited.
+
+    The caller's own group is never signalled; groups that are gone or belong to
+    another user are skipped.
+
+    Args:
+        pgids: Process group ids (a container's init pid, see :func:`container_process_groups`).
+        timeout: Seconds to wait after SIGTERM, and again after SIGKILL.
+    """
+    groups = set(pgids) - {os.getpgrp()}
+    if not groups:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pgid in groups:
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + timeout
+        groups = _live_process_groups(groups)
+        while groups and time.monotonic() < deadline:
+            time.sleep(0.1)
+            groups = _live_process_groups(groups)
+        if not groups:
+            return
+    logger.warning("process group(s) still alive after SIGKILL: %s", sorted(groups))
+
+
+def clear_enroot_containers(prefix: Optional[str] = None, timeout: float = 10.0) -> List[str]:
+    """Stop and force-remove local enroot containers, optionally only those named ``prefix*``.
+
+    ``enroot list`` is per host, so this only ever touches the node it runs on.
+    Running containers are stopped first, including processes their command started
+    in the background (see :func:`stop_process_groups`): ``enroot remove`` alone
+    deletes the root filesystem, but a server that is still running keeps its files
+    open, so the disk space would not come back. Removal is best effort: each
+    container gets its own ``enroot remove --force``, so one that refuses (e.g.
+    another process still holds it) does not stop the sweep. Survivors are logged at
+    WARNING level.
+
+    Args:
+        prefix: Only remove containers whose name starts with this string
+            (``"agentfly-"`` removes ``agentfly-…`` and nothing else). ``None``
+            removes every container on the host.
+        timeout: Seconds to wait for the containers' processes after SIGTERM (and
+            again after SIGKILL).
+
+    Returns:
+        The names that are gone afterwards, in ``enroot list`` order.
+    """
+    listed = list_containers_fancy(strict=False)
+    targets = [name for name in listed if prefix is None or name.startswith(prefix)]
+    if not targets:
+        return []
+    pids = [pid for name in targets for pid in listed[name].get("pids", [])]
+    stop_process_groups(container_process_groups(pids), timeout=timeout)
+    for name in targets:
+        try:
+            run_enroot(["remove", "--force", name], capture=False, check=False)
+        except Exception as e:  # best effort: keep sweeping
+            logger.warning("enroot remove --force %s failed: %s", name, e)
+    remaining = set(list_containers_plain(strict=False))
+    removed = [name for name in targets if name not in remaining]
+    survivors = [name for name in targets if name in remaining]
+    if survivors:
+        logger.warning(
+            "%d enroot container(s) could not be removed: %s",
+            len(survivors), ", ".join(survivors),
+        )
+    logger.info(
+        "Cleared %d enroot container(s)%s", len(removed),
+        f" with prefix {prefix!r}" if prefix else "",
+    )
+    return removed
 
