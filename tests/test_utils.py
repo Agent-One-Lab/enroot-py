@@ -282,3 +282,53 @@ def test_callers_own_group_and_session_are_never_targeted():
     assert container_process_groups([os.getpid()]) == set()
     stop_process_groups([os.getpgrp()], timeout=0.1)  # would kill this test run if signalled
     assert container_process_groups([2 ** 22 + 12345]) == set()  # no such process
+
+
+# ---- "<unknown>" rows of `enroot list --fancy` (e.g. inside Slurm job_container/tmpfs) ----
+
+FANCY_WITH_UNKNOWN = """NAME     PID   COMM    STATE  STARTED  TIME   MNTNS       USERNS      COMMAND
+<unknown> 111  python  Ssl    12:10    13:38  4026540964  4026540963  python server.py
+<unknown> 222  bash    S      12:11    00:01  4026540970  4026540969  bash
+box
+"""
+
+
+def test_parse_list_keeps_the_pids_of_repeated_names():
+    parsed = parse_list(FANCY_WITH_UNKNOWN)
+    assert parsed["<unknown>"]["pids"] == [111, 222]
+    assert parsed["box"]["pids"] == []
+
+
+def test_unknown_pids_go_to_the_container_whose_directory_is_their_root(tmp_path):
+    # This process's root is "/", so a container directory that is "/" (via a symlink)
+    # is its container; "other" is a different directory.
+    (tmp_path / "box").symlink_to("/")
+    (tmp_path / "other").mkdir()
+    gone = 2**22 + 12345  # beyond pid_max on default kernels: no such process
+    info = {"box": {"pids": []}, "other": {"pids": []}, "<unknown>": {"pids": [os.getpid(), gone]}}
+
+    utils_impl.assign_unknown_pids(info, str(tmp_path))
+
+    assert info["box"]["pids"] == [os.getpid()]
+    assert info["other"]["pids"] == []
+    assert info["<unknown>"]["pids"] == [gone]
+
+
+def test_unknown_row_is_dropped_once_all_its_pids_are_assigned(tmp_path):
+    (tmp_path / "box").symlink_to("/")
+    info = {"box": {"pids": []}, "<unknown>": {"pids": [os.getpid()]}}
+    utils_impl.assign_unknown_pids(info, str(tmp_path))
+    assert info == {"box": {"pids": [os.getpid()]}}
+
+
+def test_without_a_data_path_or_unknown_rows_nothing_changes(tmp_path):
+    info = {"box": {"pids": []}, "<unknown>": {"pids": [os.getpid()]}}
+    assert utils_impl.assign_unknown_pids(info, None) == {"box": {"pids": []}, "<unknown>": {"pids": [os.getpid()]}}
+    plain = {"box": {"pids": [7]}}
+    assert utils_impl.assign_unknown_pids(plain, str(tmp_path)) == {"box": {"pids": [7]}}
+
+
+def test_data_path_is_read_from_enroot_info():
+    out = "Enroot version: 4.2.1\nConfig file: /etc/enroot/enroot.conf\n\nEnvironment variables:\n  ENROOT_DATA_PATH=/data/user-1\n"
+    assert utils_impl._data_path_from_info(out) == "/data/user-1"
+    assert utils_impl._data_path_from_info("Enroot version: 4.2.1\n") is None

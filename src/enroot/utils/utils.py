@@ -143,7 +143,7 @@ def parse_list(text: str) -> Dict[str, Dict[str, Any]]:
     for ln in lines[1:]:
         if ln[starts["NAME"]] != " ":  # new container row
             cur = ln[starts["NAME"] : starts["PID"]].strip()
-            info[cur] = {"pids": []}
+            info.setdefault(cur, {"pids": []})  # a name can repeat (several "<unknown>" rows)
         if cur is None:
             continue
         for col, s, e in bounds:
@@ -154,6 +154,88 @@ def parse_list(text: str) -> Dict[str, Dict[str, Any]]:
                 info[cur]["pids"].append(int(field))
             else:
                 info[cur][col.lower()] = field
+    return info
+
+
+UNKNOWN_CONTAINER = "<unknown>"
+
+_DATA_PATH_CACHE: Dict[tuple, Optional[str]] = {}
+_DATA_PATH_ENV = ("ENROOT_DATA_PATH", "XDG_DATA_HOME", "HOME")
+
+
+def _data_path_from_info(out: str) -> Optional[str]:
+    for line in out.splitlines():
+        key, _, value = line.strip().partition("=")
+        if key == "ENROOT_DATA_PATH" and value:
+            return value
+    return None
+
+
+def enroot_data_path() -> Optional[str]:
+    """The directory enroot keeps containers in (``ENROOT_DATA_PATH`` as enroot resolves
+    it from the environment and its config files), read from ``enroot info``. Cached per
+    environment; ``None`` if enroot does not report it."""
+    key = tuple(os.environ.get(name) for name in _DATA_PATH_ENV)
+    if key not in _DATA_PATH_CACHE:
+        try:
+            _DATA_PATH_CACHE[key] = _data_path_from_info(run_enroot(["info"], check=False))
+        except Exception as e:  # no enroot info: leave "<unknown>" rows as they are
+            logger.debug("enroot info failed: %s", e)
+            _DATA_PATH_CACHE[key] = None
+    return _DATA_PATH_CACHE[key]
+
+
+async def enroot_data_path_async() -> Optional[str]:
+    """Async variant of :func:`enroot_data_path`."""
+    key = tuple(os.environ.get(name) for name in _DATA_PATH_ENV)
+    if key not in _DATA_PATH_CACHE:
+        try:
+            _DATA_PATH_CACHE[key] = _data_path_from_info(await run_enroot_async(["info"], check=False))
+        except Exception as e:
+            logger.debug("enroot info failed: %s", e)
+            _DATA_PATH_CACHE[key] = None
+    return _DATA_PATH_CACHE[key]
+
+
+def _dir_identity(path: str) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def assign_unknown_pids(info: Dict[str, Dict[str, Any]], data_path: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    """Give the PIDs of ``enroot list --fancy``'s ``<unknown>`` rows to their containers.
+
+    enroot names a container's process by the path of its root mount. When the data
+    directory is reached through another path (e.g. Slurm's ``job_container/tmpfs`` gives
+    each job a private copy), that fails and the process is listed as ``<unknown>``. A
+    process belongs to container ``name`` when its root directory (``/proc/<pid>/root``) is
+    the same directory, by device and inode, as ``<data_path>/<name>``; bind mounts keep the
+    inode, so this holds however the path is remapped, and another job's container never
+    matches. PIDs that match no container (or whose root cannot be read) stay ``<unknown>``.
+    ``info`` is changed in place and returned.
+    """
+    unknown = info.get(UNKNOWN_CONTAINER)
+    if not unknown or not unknown.get("pids") or not data_path:
+        return info
+    containers = {}
+    for name in info:
+        if name != UNKNOWN_CONTAINER:
+            identity = _dir_identity(os.path.join(data_path, name))
+            if identity is not None:
+                containers[identity] = name
+    remaining = []
+    for pid in unknown["pids"]:
+        name = containers.get(_dir_identity(f"/proc/{pid}/root"))
+        if name is None:
+            remaining.append(pid)
+        else:
+            info[name].setdefault("pids", []).append(pid)
+    unknown["pids"] = remaining
+    if not remaining:
+        del info[UNKNOWN_CONTAINER]
     return info
 
 
@@ -191,7 +273,7 @@ def list_containers_fancy(
                 ["list", "--fancy"],
                 check=True,
             )
-            return parse_list(out)
+            return assign_unknown_pids(parse_list(out), enroot_data_path())
         except RuntimeError:
             if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
@@ -218,7 +300,7 @@ async def list_containers_fancy_async(
                 ["list", "--fancy"],
                 check=True,
             )
-            return parse_list(out)
+            return assign_unknown_pids(parse_list(out), await enroot_data_path_async())
         except RuntimeError:
             if attempt < retries - 1:
                 await asyncio.sleep(0.5 * (attempt + 1))
